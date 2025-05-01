@@ -17,6 +17,17 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+# Check for required tools and install them if missing
+echo "Checking for required tools..."
+for tool in unzip wget e2fsck resize2fs; do
+  if ! command -v $tool &> /dev/null; then
+    echo "$tool not found. Installing required packages..."
+    apt-get update -y
+    apt-get install -y unzip wget e2fsprogs
+    break
+  fi
+done
+
 # Create working directories
 mkdir -p $WORKDIR $MOUNT_DIR
 
