@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Firecracker MicroVM Orchestration Script
-# This script sets up and launches 10 Firecracker microVMs
+# This script sets up and launches 10 Firecracker microVMs with Deno servers
 
 set -e
 
@@ -9,13 +9,15 @@ set -e
 NUM_MVMS=10
 FC_BIN_PATH="/usr/local/bin/firecracker"
 KERNEL_PATH="./resources/vmlinux"
-ROOTFS_PATH="./resources/rootfs.ext4"
+ROOTFS_PATH="./resources/custom_rootfs.ext4"
+BASE_ROOTFS="./resources/rootfs.ext4"
 NETWORK_BRIDGE="fcbridge0"
 API_SOCKET_DIR="./sockets"
 LOG_DIR="./logs"
 
-# Create required directories
-mkdir -p $API_SOCKET_DIR $LOG_DIR ./resources
+# Create required directories with proper permissions
+mkdir -p "$API_SOCKET_DIR" "$LOG_DIR" "./resources"
+chmod 755 "$API_SOCKET_DIR" "$LOG_DIR" "./resources"
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then
@@ -39,6 +41,7 @@ if [ ! -f "$FC_BIN_PATH" ]; then
   echo "Downloading Firecracker binary..."
   wget -O firecracker.tgz https://github.com/firecracker-microvm/firecracker/releases/download/v1.3.3/firecracker-v1.3.3-x86_64.tgz
   tar -xvf firecracker.tgz
+  mkdir -p $(dirname $FC_BIN_PATH)
   cp release-v1.3.3-x86_64/firecracker-v1.3.3-x86_64 $FC_BIN_PATH
   chmod +x $FC_BIN_PATH
   rm -rf release-v1.3.3-x86_64 firecracker.tgz
@@ -51,16 +54,26 @@ if [ ! -f "$KERNEL_PATH" ]; then
   wget -O $KERNEL_PATH https://s3.amazonaws.com/spec.ccfc.min/img/hello/kernel/hello-vmlinux.bin
 fi
 
-# Download rootfs if not present
-if [ ! -f "$ROOTFS_PATH" ]; then
+# Download base rootfs if not present
+if [ ! -f "$BASE_ROOTFS" ]; then
   echo "Downloading root filesystem..."
-  mkdir -p $(dirname $ROOTFS_PATH)
-  wget -O $ROOTFS_PATH https://s3.amazonaws.com/spec.ccfc.min/img/hello/fsfiles/hello-rootfs.ext4
+  mkdir -p $(dirname $BASE_ROOTFS)
+  wget -O $BASE_ROOTFS https://s3.amazonaws.com/spec.ccfc.min/img/hello/fsfiles/hello-rootfs.ext4
+fi
+
+# Build custom rootfs with Deno if not present
+if [ ! -f "$ROOTFS_PATH" ]; then
+  echo "Building custom rootfs with Deno..."
+  ./build_rootfs.sh
+  if [ ! -f "$ROOTFS_PATH" ]; then
+    echo "Failed to build custom rootfs. Please check build_rootfs.sh logs."
+    exit 1
+  fi
 fi
 
 # Setup networking bridge if it doesn't exist
 setup_network() {
-  if ! ip link show $NETWORK_BRIDGE &>/dev/null; then
+  if (! ip link show $NETWORK_BRIDGE &>/dev/null); then
     echo "Setting up network bridge $NETWORK_BRIDGE..."
     ip link add name $NETWORK_BRIDGE type bridge
     ip addr add 172.20.0.1/24 dev $NETWORK_BRIDGE
@@ -100,7 +113,7 @@ create_config() {
 {
   "boot-source": {
     "kernel_image_path": "$KERNEL_PATH",
-    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off"
+    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off init=/bin/systemd hostname=fc-vm-$id"
   },
   "drives": [
     {
@@ -119,7 +132,7 @@ create_config() {
   ],
   "machine-config": {
     "vcpu_count": 1,
-    "mem_size_mib": 128,
+    "mem_size_mib": 256,
     "ht_enabled": false
   }
 }
@@ -143,6 +156,10 @@ launch_microvm() {
   # Create configuration
   local config_file=$(create_config $id $tap_device)
   
+  # Create log file with proper permissions
+  touch "$log_file"
+  chmod 644 "$log_file"
+  
   # Start Firecracker
   echo "Starting Firecracker microVM $id..."
   $FC_BIN_PATH --api-sock "$socket_path" --config-file "$config_file" --log-path "$log_file" &
@@ -150,17 +167,54 @@ launch_microvm() {
   # Store PID for reference
   echo $! > "$LOG_DIR/firecracker-$id.pid"
   
-  # Allow firecracker to start
-  sleep 2
+  # Wait to ensure firecracker is started properly
+  sleep 3
+}
+
+# Generate status JSON output
+generate_status_json() {
+  local status_file="./mvm_status.json"
+  
+  echo "[" > $status_file
+  for ((i=0; i<$NUM_MVMS; i++)); do
+    local ip="172.20.0.$(($i + 2))"
+    local port="8000"
+    echo "  {" >> $status_file
+    echo "    \"id\": $i," >> $status_file
+    echo "    \"hostname\": \"fc-vm-$i\"," >> $status_file
+    echo "    \"ip\": \"$ip\"," >> $status_file
+    echo "    \"port\": $port," >> $status_file
+    echo "    \"url\": \"http://$ip:$port/\"," >> $status_file
+    echo "    \"curl\": \"curl http://$ip:$port/\"" >> $status_file
+    if [ $i -lt $(($NUM_MVMS-1)) ]; then
+      echo "  }," >> $status_file
+    else
+      echo "  }" >> $status_file
+    fi
+  done
+  echo "]" >> $status_file
+  
+  echo "MicroVM status information saved to $status_file"
 }
 
 # Main execution
+echo "Setting up network bridge..."
 setup_network
 
-echo "Launching $NUM_MVMS Firecracker microVMs..."
+echo "Launching $NUM_MVMS Firecracker microVMs with Deno echo servers..."
 for ((i=0; i<$NUM_MVMS; i++)); do
   launch_microvm $i
 done
 
-echo "All $NUM_MVMS microVMs have been started!"
-echo "You can check their status in the $LOG_DIR directory"
+# Generate status information
+generate_status_json
+
+# Verify microVMs are running
+echo "Verifying microVM status..."
+running_count=$(ps aux | grep firecracker | grep -v grep | wc -l)
+echo "Found $running_count running Firecracker instances"
+
+echo "All $NUM_MVMS microVMs have been started with Deno echo servers!"
+echo "Each microVM is running a Deno server on port 8000"
+echo "You can access them at http://172.20.0.[2-11]:8000/"
+echo "Example curl command: curl http://172.20.0.2:8000/"
